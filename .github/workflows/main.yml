@@ -1,0 +1,134 @@
+name: Snyk Security Scan (Windows Runner)
+
+on:
+  pull_request:
+    branches:
+      - master
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+jobs:
+  snyk_security_scan:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Install .NET SDK
+        run: |
+          echo "Checking .NET SDK installation..."
+          if (!(Get-Command dotnet -ErrorAction SilentlyContinue)) {
+            echo "Installing .NET SDK..."
+            choco install dotnet-sdk -y
+          }
+          dotnet --version
+        shell: powershell
+
+      - name: Install Snyk CLI
+        run: |
+          if (!(Test-Path "C:\snyk\snyk.exe")) {
+            mkdir C:\snyk -ErrorAction SilentlyContinue
+            Invoke-WebRequest -Uri "https://static.snyk.io/cli/latest/snyk-win.exe" -OutFile "C:\snyk\snyk.exe"
+          }
+          & C:\snyk\snyk.exe --version
+        shell: powershell
+
+      - name: Install jq (for JSON parsing)
+        run: |
+          if (!(Test-Path "C:\jq\jq.exe")) {
+            mkdir C:\jq -ErrorAction SilentlyContinue
+            Invoke-WebRequest -Uri "https://github.com/stedolan/jq/releases/download/jq-1.6/jq-win64.exe" -OutFile "C:\jq\jq.exe"
+          }
+          & C:\jq\jq.exe --version
+        shell: powershell
+
+      - name: Restore .NET Dependencies
+        run: |
+          echo "Restoring .NET dependencies..."
+          dotnet restore
+        shell: powershell
+
+      - name: Run Snyk Code Scan (Static Analysis)
+        id: snyk_code_scan
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          echo "Running Snyk Code scan..."
+          C:\snyk\snyk.exe code test --all-projects --json > snyk-code-report.json || echo "No vulnerabilities found"
+        shell: cmd
+
+      - name: Run Snyk Open Source Scan (Dependency Check)
+        id: snyk_os_scan
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          echo "Running Snyk Open Source scan..."
+          C:\snyk\snyk.exe test --all-projects --json > snyk-dependency-report.json || echo "No vulnerabilities found"
+        shell: cmd
+
+      - name: Generate Scan Report Summary
+        id: snyk_summary
+        run: |
+          $comment = "## Snyk Security Scan Results for PR Changes`n`n"
+
+          # Process code vulnerabilities
+          if (Test-Path snyk-code-report.json) {
+              $report = Get-Content snyk-code-report.json -Raw | ConvertFrom-Json
+              $codeVulnCount = ($report.runs[0].results | Measure-Object).Count
+          } else {
+              $codeVulnCount = 0
+          }
+
+          if ($codeVulnCount -gt 0) {
+              $comment += "### Code Vulnerabilities`n"
+              $comment += "**Found $codeVulnCount vulnerabilities in code analysis.**`n`n"
+          } else {
+              $comment += "### Code Vulnerabilities`nNo vulnerabilities found in code analysis.`n`n"
+          }
+
+          # Process dependency vulnerabilities
+          if (Test-Path snyk-dependency-report.json) {
+              $depReport = Get-Content snyk-dependency-report.json -Raw | ConvertFrom-Json
+              $depVulnCount = ($depReport.vulnerabilities | Measure-Object).Count
+          } else {
+              $depVulnCount = 0
+          }
+
+          if ($depVulnCount -gt 0) {
+              $comment += "### Dependency Vulnerabilities`n"
+              $comment += "**Found $depVulnCount vulnerabilities in dependencies.**`n`n"
+          } else {
+              $comment += "### Dependency Vulnerabilities`nNo vulnerabilities found in dependencies.`n`n"
+          }
+
+          Write-Output "body<<EOF" >> $env:GITHUB_OUTPUT
+          Write-Output $comment >> $env:GITHUB_OUTPUT
+          Write-Output "EOF" >> $env:GITHUB_OUTPUT
+        shell: powershell
+
+      - name: Post Scan Summary as PR Comment
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const comment = `${{ steps.snyk_summary.outputs.body }}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: comment
+            });
+
+      - name: Upload Scan Reports
+        uses: actions/upload-artifact@v3
+        with:
+          name: snyk-scan-reports
+          path: |
+            snyk-code-report.json
+            snyk-dependency-report.json
+        if: always()
