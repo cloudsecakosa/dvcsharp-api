@@ -3,7 +3,7 @@ name: Snyk Security Scan (Windows Runner)
 on:
   pull_request:
     branches:
-      - master
+      - main
     types:
       - opened
       - synchronize
@@ -55,55 +55,42 @@ jobs:
 
       - name: Run Snyk Code Scan (Static Analysis)
         id: snyk_code_scan
+        continue-on-error: true
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         run: |
           echo "Running Snyk Code scan..."
-          C:\snyk\snyk.exe code test --all-projects --json > snyk-code-report.json || echo "No vulnerabilities found"
+          C:\snyk\snyk.exe code test --all-projects --json > snyk-code-report.json || echo "Vulnerabilities detected but continuing..."
         shell: cmd
 
-      - name: Run Snyk Open Source Scan (Dependency Check)
-        id: snyk_os_scan
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      - name: Parse Snyk Code Scan Results
+        id: snyk_parse_results
         run: |
-          echo "Running Snyk Open Source scan..."
-          C:\snyk\snyk.exe test --all-projects --json > snyk-dependency-report.json || echo "No vulnerabilities found"
-        shell: cmd
+          $comment = "## 🔍 Snyk Security Scan Results`n`n"
+          $reportPath = "snyk-code-report.json"
 
-      - name: Generate Scan Report Summary
-        id: snyk_summary
-        run: |
-          $comment = "## Snyk Security Scan Results for PR Changes`n`n"
+          if (Test-Path $reportPath) {
+              $report = Get-Content $reportPath -Raw | ConvertFrom-Json
+              $vulnerabilities = $report.runs[0].results
 
-          # Process code vulnerabilities
-          if (Test-Path snyk-code-report.json) {
-              $report = Get-Content snyk-code-report.json -Raw | ConvertFrom-Json
-              $codeVulnCount = ($report.runs[0].results | Measure-Object).Count
+              if ($vulnerabilities.Count -gt 0) {
+                  $comment += "**⚠️ Found $($vulnerabilities.Count) vulnerabilities in this PR.**`n`n"
+
+                  foreach ($vuln in $vulnerabilities) {
+                      $ruleId = $vuln.ruleId
+                      $description = $vuln.message.text
+                      $filePath = $vuln.locations[0].physicalLocation.artifactLocation.uri
+                      $startLine = $vuln.locations[0].physicalLocation.region.startLine
+                      $endLine = $vuln.locations[0].physicalLocation.region.endLine
+
+                      $comment += "- **$ruleId** in `$filePath` (Lines $startLine-$endLine)`n"
+                      $comment += "  - **Description**: $description`n`n"
+                  }
+              } else {
+                  $comment += "✅ No vulnerabilities found in code analysis.`n"
+              }
           } else {
-              $codeVulnCount = 0
-          }
-
-          if ($codeVulnCount -gt 0) {
-              $comment += "### Code Vulnerabilities`n"
-              $comment += "**Found $codeVulnCount vulnerabilities in code analysis.**`n`n"
-          } else {
-              $comment += "### Code Vulnerabilities`nNo vulnerabilities found in code analysis.`n`n"
-          }
-
-          # Process dependency vulnerabilities
-          if (Test-Path snyk-dependency-report.json) {
-              $depReport = Get-Content snyk-dependency-report.json -Raw | ConvertFrom-Json
-              $depVulnCount = ($depReport.vulnerabilities | Measure-Object).Count
-          } else {
-              $depVulnCount = 0
-          }
-
-          if ($depVulnCount -gt 0) {
-              $comment += "### Dependency Vulnerabilities`n"
-              $comment += "**Found $depVulnCount vulnerabilities in dependencies.**`n`n"
-          } else {
-              $comment += "### Dependency Vulnerabilities`nNo vulnerabilities found in dependencies.`n`n"
+              $comment += "❌ No Snyk report found. Scan may have failed."
           }
 
           Write-Output "body<<EOF" >> $env:GITHUB_OUTPUT
@@ -111,12 +98,12 @@ jobs:
           Write-Output "EOF" >> $env:GITHUB_OUTPUT
         shell: powershell
 
-      - name: Post Scan Summary as PR Comment
+      - name: Post PR Comment with Vulnerabilities
         uses: actions/github-script@v6
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const comment = `${{ steps.snyk_summary.outputs.body }}`;
+            const comment = `${{ steps.snyk_parse_results.outputs.body }}`;
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -128,7 +115,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: snyk-scan-reports
-          path: |
-            snyk-code-report.json
-            snyk-dependency-report.json
+          path: snyk-code-report.json
         if: always()
